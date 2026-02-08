@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Body
+from fastapi import FastAPI, Request, Body, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -8,6 +8,9 @@ import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import json
+from datetime import datetime
+import asyncio
 
 # ======================
 # Setup FastAPI
@@ -20,39 +23,126 @@ STATIC_DIR = BASE_DIR / "static"
 MODELS_DIR = BASE_DIR / "models"
 DATA_DIR = BASE_DIR / "data"
 
+DATA_DIR.mkdir(exist_ok=True)
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 # ======================
-# Load Models
+# Load Baseline Models (A/B and more)
 # ======================
-VECTORIZER_A_PATH = MODELS_DIR / "vectorizer_20260203_161646_c03014a2.joblib"
-MODEL_A_PATH = MODELS_DIR / "sentiment_model_20260203_161646_c03014a2.joblib"
 
-VECTORIZER_B_PATH = MODELS_DIR / "vectorizer_20260203_161702_e63c055e.joblib"
-MODEL_B_PATH = MODELS_DIR / "sentiment_model_20260203_161702_e63c055e.joblib"
+MODELS_REGRESS_DIR = BASE_DIR / "models_regress"
+MODELS_LINEAR_DIR  = BASE_DIR / "models_linear"
+MODELS_RF_DIR      = BASE_DIR / "models_tree"   # ⚠️ ใช้ models_tree ตามที่คุณเทรน
+MODELS_NB_DIR      = BASE_DIR / "models_nb"
+MODELS_XGB_DIR     = BASE_DIR / "models_xgb"
+MODELS_LGBM_DIR    = BASE_DIR / "models_lgbm"
+MODELS_ET_DIR      = BASE_DIR / "models_et"
 
-for p in [
-    VECTORIZER_A_PATH,
-    MODEL_A_PATH,
-    VECTORIZER_B_PATH,
-    MODEL_B_PATH,
-]:
+# ===== Model A: Logistic Regression (default) =====
+VECTORIZER_A_PATH = MODELS_REGRESS_DIR / "vectorizer_20260208_114252_968ddfe2.joblib"
+MODEL_A_PATH      = MODELS_REGRESS_DIR / "sentiment_model_20260208_114252_968ddfe2.joblib"
+
+for p in [VECTORIZER_A_PATH, MODEL_A_PATH]:
     if not p.exists():
-        raise FileNotFoundError(f"❌ ไม่พบไฟล์: {p}")
+        raise FileNotFoundError(f"❌ ไม่พบไฟล์ Baseline A: {p}")
 
 vectorizer_a = joblib.load(VECTORIZER_A_PATH)
-classifier_a = joblib.load(MODEL_A_PATH)  # Logistic Regression
+classifier_a = joblib.load(MODEL_A_PATH)
 
-vectorizer_b = joblib.load(VECTORIZER_B_PATH)
-classifier_b = joblib.load(MODEL_B_PATH)  # LinearSVC
+# ===== Helper: Load model + vectorizer pair =====
+def load_model_pair(vec_path, model_path, name):
+    if vec_path.exists() and model_path.exists():
+        vec = joblib.load(vec_path)
+        model = joblib.load(model_path)
+        return vec, model, True
+    else:
+        print(f"⚠️ ไม่พบโมเดล: {name}")
+        return None, None, False
 
-MODEL_VERSION_A = "TF-IDF + Logistic Regression (Linear, Probabilistic)"
-MODEL_VERSION_B = "TF-IDF + Linear SVM (Max-Margin)"
+# Define all models — ✅ อัปเดตชื่อไฟล์ให้ตรงกับที่คุณให้มา
+model_configs = {
+    "linear": {
+        "vec": MODELS_LINEAR_DIR / "vectorizer_20260208_114518_03291797.joblib",
+        "model": MODELS_LINEAR_DIR / "sentiment_model_20260208_114518_03291797.joblib",
+        "name": "Linear SVM",
+        "version": "TF-IDF + Linear SVM (Max-Margin)"
+    },
+    "rf": {
+        "vec": MODELS_RF_DIR / "vectorizer_20260208_130453_6dd9ac36.joblib",
+        "model": MODELS_RF_DIR / "sentiment_model_20260208_130453_6dd9ac36.joblib",
+        "name": "Random Forest",
+        "version": "TF-IDF + Random Forest"
+    },
+    "nb": {
+        "vec": MODELS_NB_DIR / "vectorizer_20260208_132319_2e7b58b4.joblib",
+        "model": MODELS_NB_DIR / "sentiment_model_20260208_132319_2e7b58b4.joblib",
+        "name": "Naive Bayes",
+        "version": "TF-IDF + Multinomial Naive Bayes"
+    },
+    "xgb": {
+        "vec": MODELS_XGB_DIR / "vectorizer_20260208_132828_21da7a69.joblib",
+        "model": MODELS_XGB_DIR / "sentiment_model_20260208_132828_21da7a69.joblib",
+        "name": "XGBoost",
+        "version": "TF-IDF + XGBoost Classifier"
+    },
+    "lgbm": {
+        "vec": MODELS_LGBM_DIR / "vectorizer_20260208_132441_a70099f8.joblib",
+        "model": MODELS_LGBM_DIR / "sentiment_model_20260208_132441_a70099f8.joblib",
+        "name": "LightGBM",
+        "version": "TF-IDF + LightGBM"
+    },
+    "et": {
+        "vec": MODELS_ET_DIR / "vectorizer_20260208_132039_237644a6.joblib",
+        "model": MODELS_ET_DIR / "sentiment_model_20260208_132039_237644a6.joblib",
+        "name": "Extra Trees",
+        "version": "TF-IDF + Extra Trees Classifier"
+    }
+}
 
+# Load all optional models
+loaded_models = {}
+for key, cfg in model_configs.items():
+    vec, model, ok = load_model_pair(cfg["vec"], cfg["model"], cfg["name"])
+    if ok:
+        loaded_models[key] = {
+            "vectorizer": vec,
+            "classifier": model,
+            "name": cfg["name"],
+            "version": cfg["version"]
+        }
 
 # ======================
-# Helper: Global word sentiment (Model A only)
+# Load BERT Model
+# ======================
+BERT_MODEL_LOADED = False
+bert_tokenizer = None
+bert_model = None
+torch = None
+
+try:
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import torch
+
+    BERT_PATH = MODELS_DIR / "bert_thai_sentiment"
+    if BERT_PATH.exists():
+        bert_tokenizer = AutoTokenizer.from_pretrained(BERT_PATH)
+        bert_model = AutoModelForSequenceClassification.from_pretrained(
+            BERT_PATH,
+            num_labels=3
+        )
+        bert_model.eval()
+        BERT_MODEL_LOADED = True
+        print("✅ โหลด BERT สำเร็จ (3-class)")
+    else:
+        print("⚠️ ไม่พบโฟลเดอร์ BERT ที่ models/bert_thai_sentiment")
+except Exception as e:
+    print(f"❌ โหลด BERT ไม่ได้: {e}")
+    BERT_MODEL_LOADED = False
+
+# ======================
+# Global word sentiment (Model A only)
 # ======================
 def get_global_word_sentiment():
     coefs = classifier_a.coef_
@@ -76,75 +166,164 @@ def get_global_word_sentiment():
 
     return word_sentiment
 
-
 GLOBAL_WORD_SENTIMENT = get_global_word_sentiment()
 
-
 # ======================
-# Helper: Important words
+# Helper: Important words (Baseline models) — ✅ แก้ไขแล้ว!
 # ======================
 def get_important_words(text: str, vectorizer, classifier, top_k: int = 5):
     X = vectorizer.transform([text])
     feature_names = vectorizer.get_feature_names_out()
 
-    if hasattr(classifier, "predict_proba"):
-        probs = classifier.predict_proba(X)[0]
-        class_idx = int(np.argmax(probs))
-        coef = classifier.coef_[class_idx]
+    # 🌳 1. Tree-based models: RF, XGBoost, LightGBM, Extra Trees
+    if hasattr(classifier, "feature_importances_"):
+        imp = classifier.feature_importances_
+        present = X.toarray()[0]
+        contributions = present * imp
+        top_indices = np.argsort(contributions)[::-1][:top_k]
+        words = [feature_names[i] for i in top_indices if contributions[i] > 0]
+        sents = [GLOBAL_WORD_SENTIMENT.get(w, "neutral") for w in words]
+        return words[:top_k], sents[:top_k]
+
+    # 📈 2. Linear models: LogisticRegression, LinearSVC, Naive Bayes
+    elif hasattr(classifier, "coef_"):
+        if hasattr(classifier, "predict_proba"):
+            probs = classifier.predict_proba(X)[0]
+            class_idx = int(np.argmax(probs))
+            # ตรวจสอบว่าเป็น multiclass หรือ binary
+            if classifier.coef_.shape[0] > 1:
+                coef = classifier.coef_[class_idx]
+            else:
+                coef = classifier.coef_[0]
+        else:
+            # เช่น LinearSVC ที่ไม่มี predict_proba
+            if classifier.coef_.shape[0] == 1:
+                coef = classifier.coef_[0]
+            else:
+                # ถ้ามีหลายคลาสแต่ไม่มี predict_proba (กรณีหายาก)
+                decision = classifier.decision_function(X)
+                class_idx = int(np.argmax(decision))
+                coef = classifier.coef_[class_idx]
+
+        contributions = X.toarray()[0] * coef
+        top_indices = np.argsort(np.abs(contributions))[::-1][:top_k]
+        words, sentiments = [], []
+        for i in top_indices:
+            if contributions[i] == 0:
+                continue
+            word = feature_names[i]
+            words.append(word)
+            sentiments.append(GLOBAL_WORD_SENTIMENT.get(word, "neutral"))
+        return words, sentiments
+
+    # ❓ 3. Fallback
     else:
-        coef = classifier.coef_[0]
+        return [], []
 
-    contributions = X.toarray()[0] * coef
-    top_indices = np.argsort(np.abs(contributions))[::-1][:top_k]
+# ======================
+# BERT + LIME Explanation
+# ======================
+def bert_predict_proba(texts):
+    inputs = bert_tokenizer(
+        texts,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=128,
+        return_attention_mask=True
+    )
+    with torch.no_grad():
+        outputs = bert_model(**inputs)
+        probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+    return probs
 
-    words, sentiments = [], []
-    for i in top_indices:
-        if contributions[i] == 0:
-            continue
-        word = feature_names[i]
-        words.append(word)
-        sentiments.append(GLOBAL_WORD_SENTIMENT.get(word, "neutral"))
+def get_bert_important_words(text: str, top_k: int = 5):
+    if not BERT_MODEL_LOADED:
+        return [], []
 
-    return words, sentiments
+    try:
+        import lime
+        import lime.lime_text
 
+        explainer = lime.lime_text.LimeTextExplainer(
+            class_names=["NEGATIVE", "NEUTRAL", "POSITIVE"],
+            verbose=False
+        )
+
+        exp = explainer.explain_instance(
+            text,
+            bert_predict_proba,
+            num_features=top_k,
+            num_samples=200,
+            labels=[0, 1, 2]
+        )
+
+        pred_proba = bert_predict_proba([text])[0]
+        pred_label_idx = int(np.argmax(pred_proba))
+
+        word_weights = exp.as_list(label=pred_label_idx)
+        words = []
+        sentiments = []
+
+        for word, weight in word_weights[:top_k]:
+            words.append(word)
+            if pred_label_idx == 0:  # NEGATIVE
+                s = "negative" if weight > 0 else "positive"
+            elif pred_label_idx == 2:  # POSITIVE
+                s = "positive" if weight > 0 else "negative"
+            else:  # NEUTRAL
+                s = "neutral"
+            sentiments.append(s)
+
+        return words, sentiments
+
+    except Exception as e:
+        print(f"LIME error: {e}")
+        return [], []
 
 # ======================
 # Routes
 # ======================
 
-
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {
+        "status": "ok",
+        "baseline_a": True,
+        "available_models": list(loaded_models.keys()) + (["bert"] if BERT_MODEL_LOADED else []),
+        "bert": BERT_MODEL_LOADED,
+    }
 
 @app.get("/model/info")
 def model_info():
-    return {
+    info = {
         "model_a": {
             "name": "sentiment_lr",
-            "version": MODEL_VERSION_A,
+            "version": "TF-IDF + Logistic Regression (Linear, Probabilistic)",
             "file": MODEL_A_PATH.name,
-        },
-        "model_b": {
-            "name": "sentiment_linear_svm",
-            "version": MODEL_VERSION_B,
-            "file": MODEL_B_PATH.name,
-        },
+        }
     }
-
+    for key, mdl in loaded_models.items():
+        info[key] = {
+            "name": mdl["name"],
+            "version": mdl["version"],
+        }
+    if BERT_MODEL_LOADED:
+        info["bert"] = {
+            "name": "Thai BERT (wangchanberta)",
+            "path": "models/bert_thai_sentiment",
+        }
+    return info
 
 @app.get("/errors", response_class=HTMLResponse)
 def show_errors(request: Request):
     all_errors = []
-    seen = set()  # ใช้สำหรับตรวจสอบซ้ำ
+    seen = set()
 
-    # 1. Static errors (ไม่ซ้ำแน่นอน ไม่ต้อง dedup)
     try:
         errors_path = DATA_DIR / "error_examples.csv"
         if errors_path.exists():
@@ -153,28 +332,23 @@ def show_errors(request: Request):
                 text = str(row.get("text", "")).strip()
                 true_label = str(row.get("true_label", "?"))
                 pred_label = str(row.get("pred_label", "?"))
-                key = f"{text}|{true_label}|{pred_label}"  # key สำหรับ static
+                key = f"{text}|{true_label}|{pred_label}"
                 if key not in seen:
                     seen.add(key)
-                    all_errors.append(
-                        {
-                            "text": text,
-                            "true_label": true_label,
-                            "pred_label": pred_label,
-                            "source": "train_misclassified",
-                        }
-                    )
+                    all_errors.append({
+                        "text": text,
+                        "true_label": true_label,
+                        "pred_label": pred_label,
+                        "source": "train_misclassified",
+                    })
     except Exception as e:
         print(f"Error loading static errors: {e}")
 
-    # 2. User feedback (deduplicate by text + model)
     try:
         feedback_path = DATA_DIR / "feedback_log.jsonl"
         if feedback_path.exists():
             with open(feedback_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-
-            # อ่านจากล่างขึ้นบน เพื่อเก็บรายการล่าสุดก่อน (ถ้ามีซ้ำ)
             for line in reversed(lines):
                 if line.strip():
                     try:
@@ -182,32 +356,23 @@ def show_errors(request: Request):
                         if fb.get("feedback") == "incorrect":
                             text = str(fb.get("text", "")).strip()
                             model = fb.get("model", "")
-                            # สร้าง key สำหรับ dedup
                             key = f"{text}|{model}"
-
                             if key not in seen:
                                 seen.add(key)
-                                all_errors.append(
-                                    {
-                                        "text": text,
-                                        "true_label": str(
-                                            fb.get("true_label", "UNKNOWN")
-                                        ),
-                                        "pred_label": str(
-                                            fb.get("predicted_label", "?")
-                                        ),
-                                        "source": "user_feedback",
-                                        "model": model,
-                                        "timestamp": fb.get("timestamp", ""),
-                                    }
-                                )
+                                all_errors.append({
+                                    "text": text,
+                                    "true_label": str(fb.get("true_label", "UNKNOWN")),
+                                    "pred_label": str(fb.get("predicted_label", "?")),
+                                    "source": "user_feedback",
+                                    "model": model,
+                                    "timestamp": fb.get("timestamp", ""),
+                                })
                     except Exception as ex:
                         print(f"Invalid feedback line: {ex}")
                         continue
     except Exception as e:
         print(f"Error loading feedback: {e}")
 
-    # เรียงตาม timestamp (ใหม่ไปเก่า) — แต่ตอนนี้ all_errors มีแค่ unique แล้ว
     all_errors.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
     errors_to_show = all_errors[:20]
 
@@ -215,11 +380,9 @@ def show_errors(request: Request):
         "errors.html", {"request": request, "errors": errors_to_show}
     )
 
-
 # ======================
 # Predict Endpoints
 # ======================
-
 
 @app.post("/predict")
 def predict(text: str = Body(..., embed=True)):
@@ -234,16 +397,18 @@ def predict(text: str = Body(..., embed=True)):
         "label": str(pred).upper(),
         "confidence": round(prob, 2),
         "latency_ms": round(latency, 2),
-        "model": "TF-IDF + Logistic Regression",
-        "version": MODEL_VERSION_A,
+        "model": "sentiment_lr",
+        "version": "TF-IDF + Logistic Regression (Linear, Probabilistic)",
         "important_words": words,
         "word_sentiments": sents,
     }
 
-
 @app.post("/predict-ab")
-def predict_ab(text: str = Body(..., embed=True)):
-    # Model A
+def predict_ab(
+    text: str = Body(..., embed=True),
+    model_b_type: str = Body("linear", embed=True)
+):
+    # ===== Model A =====
     start_a = time.time()
     Xa = vectorizer_a.transform([text])
     pred_a = classifier_a.predict(Xa)[0]
@@ -251,43 +416,156 @@ def predict_ab(text: str = Body(..., embed=True)):
     latency_a = (time.time() - start_a) * 1000
     words_a, sents_a = get_important_words(text, vectorizer_a, classifier_a)
 
-    # Model B
-    start_b = time.time()
-    Xb = vectorizer_b.transform([text])
-    pred_b = classifier_b.predict(Xb)[0]
-    score_b = classifier_b.decision_function(Xb)
-    raw_score = float(score_b.ravel()[0])
-    confidence_b = float(1 / (1 + np.exp(-abs(raw_score))))
-    latency_b = (time.time() - start_b) * 1000
-    words_b, sents_b = get_important_words(text, vectorizer_b, classifier_b)
-
-    return {
+    result = {
         "model_a": {
             "label": str(pred_a).upper(),
             "confidence": round(prob_a, 2),
             "latency_ms": round(latency_a, 2),
             "model_name": "sentiment_lr",
-            "version": MODEL_VERSION_A,
+            "version": "TF-IDF + Logistic Regression",
             "important_words": words_a,
             "word_sentiments": sents_a,
         },
-        "model_b": {
-            "label": str(pred_b).upper(),
-            "confidence": round(confidence_b, 2),
-            "latency_ms": round(latency_b, 2),
-            "model_name": "sentiment_linear_svm",
-            "version": MODEL_VERSION_B,
-            "important_words": words_b,
-            "word_sentiments": sents_b,
-        },
+        "model_b": None
     }
 
+    # ===== Model B =====
+    if model_b_type == "bert" and BERT_MODEL_LOADED:
+        start_b = time.time()
+        inputs = bert_tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=128,
+            return_attention_mask=True
+        )
+        with torch.no_grad():
+            outputs = bert_model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)
+            pred_idx = torch.argmax(probs, dim=-1).item()
+            confidence = probs[0][pred_idx].item()
 
-import json
-from datetime import datetime
+        latency_b = (time.time() - start_b) * 1000
+        words_b, sents_b = get_bert_important_words(text, top_k=5)
+        
+        if hasattr(bert_model.config, 'id2label'):
+            raw_label = bert_model.config.id2label[pred_idx].lower()
+            if raw_label in ['neg', 'negative', 'แย่']:
+                label_b = "NEGATIVE"
+            elif raw_label in ['neu', 'neutral', 'กลาง']:
+                label_b = "NEUTRAL"
+            elif raw_label in ['pos', 'positive', 'ดี']:
+                label_b = "POSITIVE"
+            else:
+                label_b = raw_label.upper()
+        else:
+            id2label = {0: "NEGATIVE", 1: "NEUTRAL", 2: "POSITIVE"}
+            label_b = id2label.get(pred_idx, "UNKNOWN")
 
+        result["model_b"] = {
+            "label": label_b,
+            "confidence": round(confidence, 2),
+            "latency_ms": round(latency_b, 2),
+            "model_name": "Thai BERT",
+            "version": "wangchanberta + LIME",
+            "important_words": words_b,
+            "word_sentiments": sents_b,
+        }
+
+    elif model_b_type in loaded_models:
+        mdl = loaded_models[model_b_type]
+        start_b = time.time()
+        Xb = mdl["vectorizer"].transform([text])
+        pred_b = mdl["classifier"].predict(Xb)[0]
+
+        # Confidence logic
+        if hasattr(mdl["classifier"], "predict_proba"):
+            prob_b = float(np.max(mdl["classifier"].predict_proba(Xb)[0]))
+        elif hasattr(mdl["classifier"], "decision_function"):
+            score = mdl["classifier"].decision_function(Xb)
+            prob_b = float(1 / (1 + np.exp(-abs(score.ravel()[0]))))
+        else:
+            prob_b = 0.95  # fallback
+
+        latency_b = (time.time() - start_b) * 1000
+        words_b, sents_b = get_important_words(text, mdl["vectorizer"], mdl["classifier"])
+
+        result["model_b"] = {
+            "label": str(pred_b).upper(),
+            "confidence": round(prob_b, 2),
+            "latency_ms": round(latency_b, 2),
+            "model_name": mdl["name"],
+            "version": mdl["version"],
+            "important_words": words_b,
+            "word_sentiments": sents_b,
+        }
+
+    else:
+        available = list(loaded_models.keys()) + (["bert"] if BERT_MODEL_LOADED else [])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model B type '{model_b_type}' not available. Available: {available}"
+        )
+
+    return result
+
+@app.post("/predict-bert")
+def predict_bert(text: str = Body(..., embed=True)):
+    if not BERT_MODEL_LOADED:
+        raise HTTPException(status_code=500, detail="BERT model not available")
+
+    start = time.time()
+    try:
+        inputs = bert_tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=128,
+            return_attention_mask=True
+        )
+
+        with torch.no_grad():
+            outputs = bert_model(**inputs)
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)
+            pred_idx = torch.argmax(probs, dim=-1).item()
+            confidence = probs[0][pred_idx].item()
+
+        latency = (time.time() - start) * 1000
+        words, sents = get_bert_important_words(text, top_k=5)
+
+        if hasattr(bert_model.config, 'id2label'):
+            raw_label = bert_model.config.id2label[pred_idx].lower()
+            if raw_label in ['neg', 'negative', 'แย่']:
+                label = "NEGATIVE"
+            elif raw_label in ['neu', 'neutral', 'กลาง']:
+                label = "NEUTRAL"
+            elif raw_label in ['pos', 'positive', 'ดี']:
+                label = "POSITIVE"
+            else:
+                label = raw_label.upper()
+        else:
+            id2label = {0: "NEGATIVE", 1: "NEUTRAL", 2: "POSITIVE"}
+            label = id2label.get(pred_idx, "UNKNOWN")
+
+        return {
+            "label": label,
+            "confidence": round(confidence, 2),
+            "latency_ms": round(latency, 2),
+            "model": "Thai BERT (wangchanberta + LIME)",
+            "important_words": words,
+            "word_sentiments": sents,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"BERT prediction error: {str(e)}")
+
+# ======================
+# Feedback Logging
+# ======================
 FEEDBACK_LOG_PATH = DATA_DIR / "feedback_log.jsonl"
-
 
 @app.post("/feedback")
 async def log_feedback(request: Request):
@@ -296,9 +574,6 @@ async def log_feedback(request: Request):
         required_fields = ["text", "model", "predicted_label", "feedback"]
         if not all(field in data for field in required_fields):
             return JSONResponse({"error": "Missing required fields"}, status_code=400)
-
-        # บันทึก true_label ถ้ามี (ไม่บังคับ)
-        # ไม่ต้อง validate เพราะอาจไม่มี (กรณี 👍)
 
         if "timestamp" not in data:
             data["timestamp"] = datetime.utcnow().isoformat()
@@ -311,14 +586,9 @@ async def log_feedback(request: Request):
         print(f"Feedback error: {e}")
         return JSONResponse({"error": "Failed to log feedback"}, status_code=500)
 
-import asyncio
-import os
-from datetime import datetime
-
-FEEDBACK_LOG_PATH = DATA_DIR / "feedback_log.jsonl"
-
-# === เพิ่มฟังก์ชันล้าง feedback ===
-# แทนที่ฟังก์ชัน clear_feedback_periodically() ด้วย:
+# ======================
+# Background Task
+# ======================
 async def rotate_feedback_periodically(max_lines=100):
     while True:
         await asyncio.sleep(600)
@@ -326,9 +596,7 @@ async def rotate_feedback_periodically(max_lines=100):
             if FEEDBACK_LOG_PATH.exists():
                 with open(FEEDBACK_LOG_PATH, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-                
                 if len(lines) > max_lines:
-                    # เก็บแค่ max_lines รายการล่าสุด
                     recent_lines = lines[-max_lines:]
                     with open(FEEDBACK_LOG_PATH, "w", encoding="utf-8") as f:
                         f.writelines(recent_lines)
@@ -336,7 +604,6 @@ async def rotate_feedback_periodically(max_lines=100):
         except Exception as e:
             print(f"[{datetime.now()}] ❌ rotate feedback error: {e}")
 
-# === เริ่ม background task เมื่อแอปเริ่มทำงาน ===
 @app.on_event("startup")
 async def start_background_tasks():
     asyncio.create_task(rotate_feedback_periodically())
