@@ -169,6 +169,33 @@ def get_global_word_sentiment():
 GLOBAL_WORD_SENTIMENT = get_global_word_sentiment()
 
 # ======================
+# Label mapping helper — ✅ เพิ่มใหม่!
+# ======================
+LABEL_MAP = {
+    0: "NEGATIVE",
+    1: "NEUTRAL",
+    2: "POSITIVE",
+    "0": "NEGATIVE",
+    "1": "NEUTRAL",
+    "2": "POSITIVE",
+}
+
+def normalize_label(label):
+    """แปลง label ใดๆ → 'NEGATIVE' / 'NEUTRAL' / 'POSITIVE'"""
+    if isinstance(label, str):
+        label_lower = label.lower()
+        if label_lower in ["negative", "neg", "แย่", "ห่วย", "ลบ", "0"]:
+            return "NEGATIVE"
+        elif label_lower in ["neutral", "neu", "กลาง", "เฉยๆ", "กลางๆ", "1"]:
+            return "NEUTRAL"
+        elif label_lower in ["positive", "pos", "ดี", "บวก", "ชอบ", "2"]:
+            return "POSITIVE"
+        else:
+            return LABEL_MAP.get(label, label.upper())
+    else:
+        return LABEL_MAP.get(label, str(label).upper())
+
+# ======================
 # Helper: Important words (Baseline models) — ✅ แก้ไขแล้ว!
 # ======================
 def get_important_words(text: str, vectorizer, classifier, top_k: int = 5):
@@ -190,17 +217,14 @@ def get_important_words(text: str, vectorizer, classifier, top_k: int = 5):
         if hasattr(classifier, "predict_proba"):
             probs = classifier.predict_proba(X)[0]
             class_idx = int(np.argmax(probs))
-            # ตรวจสอบว่าเป็น multiclass หรือ binary
             if classifier.coef_.shape[0] > 1:
                 coef = classifier.coef_[class_idx]
             else:
                 coef = classifier.coef_[0]
         else:
-            # เช่น LinearSVC ที่ไม่มี predict_proba
             if classifier.coef_.shape[0] == 1:
                 coef = classifier.coef_[0]
             else:
-                # ถ้ามีหลายคลาสแต่ไม่มี predict_proba (กรณีหายาก)
                 decision = classifier.decision_function(X)
                 class_idx = int(np.argmax(decision))
                 coef = classifier.coef_[class_idx]
@@ -381,20 +405,21 @@ def show_errors(request: Request):
     )
 
 # ======================
-# Predict Endpoints
+# Predict Endpoints — ✅ แก้ไขให้ใช้ normalize_label()
 # ======================
 
 @app.post("/predict")
 def predict(text: str = Body(..., embed=True)):
     start = time.time()
     X = vectorizer_a.transform([text])
-    pred = classifier_a.predict(X)[0]
+    pred_raw = classifier_a.predict(X)[0]
+    pred = normalize_label(pred_raw)  # ✅ แปลง label
     prob = float(np.max(classifier_a.predict_proba(X)[0]))
     latency = (time.time() - start) * 1000
     words, sents = get_important_words(text, vectorizer_a, classifier_a)
 
     return {
-        "label": str(pred).upper(),
+        "label": pred,
         "confidence": round(prob, 2),
         "latency_ms": round(latency, 2),
         "model": "sentiment_lr",
@@ -411,14 +436,15 @@ def predict_ab(
     # ===== Model A =====
     start_a = time.time()
     Xa = vectorizer_a.transform([text])
-    pred_a = classifier_a.predict(Xa)[0]
+    pred_a_raw = classifier_a.predict(Xa)[0]
+    pred_a = normalize_label(pred_a_raw)
     prob_a = float(np.max(classifier_a.predict_proba(Xa)[0]))
     latency_a = (time.time() - start_a) * 1000
     words_a, sents_a = get_important_words(text, vectorizer_a, classifier_a)
 
     result = {
         "model_a": {
-            "label": str(pred_a).upper(),
+            "label": pred_a,
             "confidence": round(prob_a, 2),
             "latency_ms": round(latency_a, 2),
             "model_name": "sentiment_lr",
@@ -452,14 +478,7 @@ def predict_ab(
         
         if hasattr(bert_model.config, 'id2label'):
             raw_label = bert_model.config.id2label[pred_idx].lower()
-            if raw_label in ['neg', 'negative', 'แย่']:
-                label_b = "NEGATIVE"
-            elif raw_label in ['neu', 'neutral', 'กลาง']:
-                label_b = "NEUTRAL"
-            elif raw_label in ['pos', 'positive', 'ดี']:
-                label_b = "POSITIVE"
-            else:
-                label_b = raw_label.upper()
+            label_b = normalize_label(raw_label)
         else:
             id2label = {0: "NEGATIVE", 1: "NEUTRAL", 2: "POSITIVE"}
             label_b = id2label.get(pred_idx, "UNKNOWN")
@@ -478,7 +497,8 @@ def predict_ab(
         mdl = loaded_models[model_b_type]
         start_b = time.time()
         Xb = mdl["vectorizer"].transform([text])
-        pred_b = mdl["classifier"].predict(Xb)[0]
+        pred_b_raw = mdl["classifier"].predict(Xb)[0]
+        pred_b = normalize_label(pred_b_raw)  # ✅ แปลง label
 
         # Confidence logic
         if hasattr(mdl["classifier"], "predict_proba"):
@@ -493,7 +513,7 @@ def predict_ab(
         words_b, sents_b = get_important_words(text, mdl["vectorizer"], mdl["classifier"])
 
         result["model_b"] = {
-            "label": str(pred_b).upper(),
+            "label": pred_b,
             "confidence": round(prob_b, 2),
             "latency_ms": round(latency_b, 2),
             "model_name": mdl["name"],
@@ -539,14 +559,7 @@ def predict_bert(text: str = Body(..., embed=True)):
 
         if hasattr(bert_model.config, 'id2label'):
             raw_label = bert_model.config.id2label[pred_idx].lower()
-            if raw_label in ['neg', 'negative', 'แย่']:
-                label = "NEGATIVE"
-            elif raw_label in ['neu', 'neutral', 'กลาง']:
-                label = "NEUTRAL"
-            elif raw_label in ['pos', 'positive', 'ดี']:
-                label = "POSITIVE"
-            else:
-                label = raw_label.upper()
+            label = normalize_label(raw_label)
         else:
             id2label = {0: "NEGATIVE", 1: "NEUTRAL", 2: "POSITIVE"}
             label = id2label.get(pred_idx, "UNKNOWN")
