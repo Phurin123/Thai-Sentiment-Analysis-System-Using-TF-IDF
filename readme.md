@@ -907,7 +907,3 @@ GitHub: [https://github.com/Phurin123](https://github.com/Phurin123)
 หากพบปัญหาหรือมีคำถาม:
 - เปิด Issue ใน GitHub Repository
 - ติดต่อผ่าน Email หรือ social media
-
----
-
-**Happy Analyzing! 🎉**
