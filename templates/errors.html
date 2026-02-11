@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ตัวอย่างข้อผิดพลาด</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+    />
+    <style>
+      .error-item {
+        border-left: 4px solid #dc3545;
+        padding-left: 15px;
+        margin-bottom: 20px;
+      }
+      .true-label {
+        color: green;
+        font-weight: bold;
+      }
+      .pred-label {
+        color: red;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container mt-4">
+      <h2 class="mb-4">ตัวอย่างข้อผิดพลาด (Misclassified Examples)</h2>
+      {% for ex in errors %}
+      <div class="error-item">
+        <p><strong>ข้อความ:</strong> {{ ex.text }}</p>
+        <p>
+          <span class="true-label">จริง: {{ ex.true_label }}</span> |
+          <span class="pred-label">ทำนาย: {{ ex.pred_label }}</span>
+        </p>
+      </div>
+      {% endfor %}
+      <a href="/" class="btn btn-secondary">กลับหน้าหลัก</a>
+    </div>
+  </body>
+</html>
